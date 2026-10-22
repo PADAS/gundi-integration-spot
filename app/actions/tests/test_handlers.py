@@ -21,9 +21,11 @@ from app.actions.handlers import (
     action_pull_observations,
 )
 from app.services.errors import (
+    IntegrationAuthError,
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationConnectionError,
+    IntegrationRateLimitError,
 )
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -72,6 +74,7 @@ def state_manager():
     manager.get_state = AsyncMock(return_value={})
     manager.set_state = AsyncMock()
     manager.set_if_absent = AsyncMock(return_value=True)
+    manager.delete_state = AsyncMock()
     return manager
 
 
@@ -275,6 +278,17 @@ async def test_all_feeds_failed_raises_configuration_error(run, fetch):
     assert "AAAA" not in str(info.value) and "BBBB" not in str(info.value)
 
 
+@pytest.mark.asyncio
+async def test_all_feeds_failed_raises_the_dominant_error(run, fetch):
+    """The run-level error carries the classification operators need: a wrong
+    password on every feed reads as 'Authentication failed', not 'Invalid configuration'."""
+    async def fetch_side_effect(feed_id, *args, **kwargs):
+        raise SpotFeedNotFound("Feed not found") if feed_id == "C" else SpotFeedAuthError("Feed password required")
+    fetch.side_effect = fetch_side_effect
+    with pytest.raises(IntegrationAuthError):
+        await run(_config("A", "B", "C"))
+
+
 # --- systemic failures ----------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -308,7 +322,7 @@ async def test_transport_error_recovers_on_second_attempt(run, fetch, send, log_
 @pytest.mark.asyncio
 async def test_4xx_is_not_retried(run, fetch, sleep):
     fetch.side_effect = SpotFeedAuthError("Feed password required")
-    with pytest.raises(IntegrationConfigurationError):
+    with pytest.raises(IntegrationAuthError):
         await run(_config("A"))
     assert fetch.await_count == 1
     sleep.assert_not_awaited()
@@ -411,4 +425,80 @@ async def test_non_integer_unix_time_is_dropped_on_first_run(run, fetch, send, s
     fetch.return_value = [_msg("not-a-time"), _msg(T + 1)]
     result = await run(_config("A"))
     assert result == {"feeds": 1, "observations_sent": 1, "observations_dropped": 1, "feeds_failed": [], "feeds_skipped": []}
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
+
+
+# --- second review pass ----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_one_http_client_is_shared_across_the_run(run, fetch):
+    await run(_config("A", "B", "C"))
+    clients = [c.kwargs["client"] for c in fetch.await_args_list]
+    assert all(isinstance(c, httpx.AsyncClient) for c in clients)
+    assert len({id(c) for c in clients}) == 1
+    assert clients[0].is_closed
+
+
+@pytest.mark.asyncio
+async def test_gundi_transport_failure_is_not_reported_as_spot_outage(run, fetch, send):
+    """A Gundi outage must keep the template's 'Gundi API request failed' classification."""
+    fetch.return_value = [_msg(T + 1)]
+    send.side_effect = httpx.ConnectError("gundi down")
+    with pytest.raises(httpx.ConnectError):
+        await run(_config("A"))
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_aborts_the_run_as_retryable(run, fetch, log_activity):
+    """A 429 is IP-level: stop hitting SPOT instead of polling 49 more feeds."""
+    fetch.side_effect = SpotRateLimited("Too many requests")
+    with pytest.raises(IntegrationRateLimitError):
+        await run(_config("A", "B"))
+    assert fetch.await_count == 1
+    log_activity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cooldown_is_cleared_when_spot_was_not_reached(run, fetch, state_manager):
+    fetch.side_effect = httpx.ConnectError("boom")
+    with pytest.raises(IntegrationConnectionError):
+        await run(_config("A"))
+    state_manager.delete_state.assert_awaited_once_with(
+        integration_id=INTEGRATION_ID, action_id=ACTION_ID, source_id="A:cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cooldown_is_kept_when_spot_answered_with_an_error(run, fetch, state_manager):
+    fetch.side_effect = SpotFeedAuthError("Feed password required")
+    with pytest.raises(IntegrationAuthError):
+        await run(_config("A"))
+    state_manager.delete_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_absurd_unix_time_does_not_crash_the_feed(run, fetch, send, state_manager):
+    fetch.return_value = [_msg(10**15), _msg(T + 1)]
+    result = await run(_config("A"))
+    assert result["observations_sent"] == 1 and result["observations_dropped"] == 1
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
+
+
+@pytest.mark.asyncio
+async def test_stored_mark_is_capped_at_now(run, fetch, send, state_manager):
+    """A message slightly ahead of now (clock skew) is sent, but the mark never passes now,
+    so the next window never starts after it ends."""
+    now_ts = int(NOW.timestamp())
+    fetch.return_value = [_msg(now_ts + 120)]
+    await run(_config("A"))
+    assert len(send.await_args.kwargs["observations"]) == 1
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": now_ts}
+
+
+@pytest.mark.asyncio
+async def test_state_advances_when_all_messages_are_junk(run, fetch, send, state_manager):
+    """A decommissioned device must not make every run re-fetch the same window."""
+    fetch.return_value = [{**_msg(T + 1), "latitude": 999}]
+    await run(_config("A"))
+    send.assert_not_awaited()
     assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}

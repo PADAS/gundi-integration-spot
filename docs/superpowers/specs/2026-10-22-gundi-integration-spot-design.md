@@ -170,21 +170,26 @@ For each distinct feed, in order:
 5. Transform the rest to Gundi observations (below) and send them in one
    `send_observations_to_gundi` call per feed. If there are none, send
    nothing.
-6. Advance the feed's state to the maximum `unixTime` seen in this fetch
-   (valid or not — a junk message with a 1000 AD date never advances it
-   because it is below the current value; use `max(current, seen)`).
-   State is only written after the send succeeds, so a failed send is
-   retried next run.
+6. Advance the feed's state to the maximum *plausible* `unixTime` seen in
+   this fetch, valid position or not: an integer no more than 5 minutes
+   ahead of now, capped at now. A junk 1000 AD date never wins, a far-future
+   clock reading never bricks the feed, and the next window never starts
+   after it ends. State advances even when nothing was sendable, so a
+   device sending only junk does not re-fetch the same window every run.
+   When there are observations, state is only written after the send
+   succeeds, so a failed send is retried next run.
 7. Sleep 2 seconds before the next feed.
 
 **Feed-specific failures continue; systemic failures abort.** (Brainstorm
 author's call, after the builder check.)
 
 - A *feed-specific* error (`SpotFeedAuthError`, `SpotFeedNotFound`,
-  `SpotBadResponse`, `SpotRateLimited`) is caught, logged with
-  `log_action_activity` at ERROR including the feed ID (never the
-  password) and the classified cause, and the loop continues to the next
-  feed.
+  `SpotBadResponse`) is caught, logged with `log_action_activity` at ERROR
+  including the feed ID (never the password) and the classified cause, and
+  the loop continues to the next feed.
+- A *rate limit* (`SpotRateLimited`, HTTP 429) is IP-level, not per feed:
+  it aborts the run as a retryable `IntegrationRateLimitError` instead of
+  polling the remaining feeds. (Changed after review on 2026-10-22.)
 - A *systemic* error aborts the run and propagates: an `httpx` transport
   error that survives the retries below (SPOT or the network is down for
   every feed, so continuing only burns time), or any failure from
@@ -195,12 +200,16 @@ author's call, after the builder check.)
   is re-fetched next run.
 - The action returns a summary dict
   `{"feeds": n, "observations_sent": n, "feeds_failed": [feed_id, ...]}`.
-  If *every* feed failed with a feed-specific error, the action raises
-  `IntegrationConfigurationError` (error_type `configuration`, which the
-  template treats as final, so PubSub does **not** redeliver) so the
-  activity log shows the run as failed. The 5-minute schedule is the only
-  thing that re-polls SPOT; a redelivered run must never re-poll inside
-  SPOT's 2.5-minute window.
+  If *every* polled feed failed with a feed-specific error, the action
+  raises the classified error that dominates the feed failures (all bad
+  passwords → `IntegrationAuthError`, unknown feeds →
+  `IntegrationConfigurationError`, ...) so the portal title is meaningful.
+  A redelivered run must never re-poll inside SPOT's 2.5-minute window:
+  each feed gets a 150 s cooldown key in Redis (`set_if_absent`) when it is
+  polled, feeds still in cooldown are skipped and reported as
+  `feeds_skipped`, and the key is cleared when SPOT was never reached so a
+  redelivery can recover. (Changed after review on 2026-10-22; the original
+  design raised a blanket configuration error to avoid redelivery.)
 
 Retries: the handler retries a SPOT request on `httpx` transport errors
 and 5xx with short exponential backoff (3 attempts, 1/2/4 s, 10 s

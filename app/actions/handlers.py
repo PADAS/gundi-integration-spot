@@ -113,19 +113,28 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
+class SpotUnreachable(Exception):
+    """SPOT gave no usable answer after retries (transport failure or 5xx).
+    Carries the classified IntegrationError the run should fail with."""
+
+    def __init__(self, classified: IntegrationError):
+        super().__init__(classified.message)
+        self.classified = classified
+
+
 async def _fetch_with_retries(
-    feed_id: str, start: datetime, end: datetime, *, feed_password: Optional[str]
+    feed_id: str, start: datetime, end: datetime, *, feed_password: Optional[str], client: httpx.AsyncClient
 ) -> list:
-    """Retry transport errors and 5xx with a short backoff; SPOT's own errors (4xx, envelopes) are final."""
+    """Retry transport errors and 5xx with a short backoff; SPOT's own errors (4xx, envelopes) are final.
+    Exhausted or non-retryable httpx errors become SpotUnreachable so that an httpx error raised
+    later by the Gundi send is never mistaken for a SPOT outage."""
     attempts = len(RETRY_BACKOFF_SECONDS)
     for attempt in range(attempts):
         try:
-            return await fetch_messages(
-                feed_id, start, end, feed_password=feed_password, timeout=REQUEST_TIMEOUT_SECONDS
-            )
-        except Exception as e:
+            return await fetch_messages(feed_id, start, end, feed_password=feed_password, client=client)
+        except httpx.HTTPError as e:
             if not _is_retryable(e) or attempt == attempts - 1:
-                raise
+                raise SpotUnreachable(_classify_feed_error(e)) from e
             logger.warning(
                 "SPOT request for feed %s failed (attempt %d/%d): %s",
                 feed_id, attempt + 1, attempts, redact_text(str(e).splitlines()[0] if str(e) else type(e).__name__),
@@ -142,6 +151,7 @@ async def _pull_feed(
     initial_lookback_hours: int,
     state_manager: IntegrationStateManager,
     now: datetime,
+    client: httpx.AsyncClient,
 ) -> Tuple[int, int]:
     """Fetch, filter, send and advance one feed. Returns (observations sent, messages dropped)."""
     state = await state_manager.get_state(
@@ -152,7 +162,14 @@ async def _pull_feed(
     start, end = _compute_window(last_unix_time, initial_lookback_hours=initial_lookback_hours, now=now)
 
     password = feed.feed_password.get_secret_value() if feed.feed_password else None
-    messages = await _fetch_with_retries(feed.feed_id, start, end, feed_password=password)
+    try:
+        messages = await _fetch_with_retries(feed.feed_id, start, end, feed_password=password, client=client)
+    except SpotUnreachable:
+        # SPOT was never polled, so this attempt must not count against the cooldown.
+        await state_manager.delete_state(
+            integration_id=integration_id, action_id=ACTION_ID, source_id=_cooldown_key(feed.feed_id)
+        )
+        raise
     if last_unix_time is not None:
         # SPOT may ignore the dates, re-send, or deliver out of order: filter here regardless.
         messages = [m for m in messages if isinstance(m.get("unixTime"), int) and m["unixTime"] > last_unix_time]
@@ -163,28 +180,36 @@ async def _pull_feed(
     )
     if dropped:
         logger.info("SPOT feed %s: dropped %d messages with invalid position or date", feed.feed_id, dropped)
-    if not observations:
-        return 0, dropped
+    if observations:
+        await send_observations_to_gundi(observations=observations, integration_id=integration_id)
 
-    await send_observations_to_gundi(observations=observations, integration_id=integration_id)
-
-    # Advance to the newest plausible time seen, valid position or not (a junk
-    # year-1000 date never wins; a far-future date is not plausible and is
-    # excluded so one bad clock reading cannot brick the feed).
-    horizon = now + MAX_FUTURE_SKEW
-    newest = max(
+    # Advance to the newest plausible time seen, valid position or not, so a
+    # device sending only junk does not make every run re-fetch the same window.
+    # Plausible: an integer no further ahead than the skew allowance (a junk
+    # year-1000 date never wins; a far-future date never bricks the feed), and
+    # the stored mark never passes `now`, so the next window cannot start after
+    # it ends. Integer comparison only: no datetime conversion that could raise.
+    now_ts = int(now.timestamp())
+    horizon_ts = now_ts + int(MAX_FUTURE_SKEW.total_seconds())
+    plausible = [
         m["unixTime"] for m in messages
         if isinstance(m.get("unixTime"), int) and not isinstance(m.get("unixTime"), bool)
-        and datetime.fromtimestamp(m["unixTime"], tz=timezone.utc) <= horizon
-    )
-    if last_unix_time is None or newest > last_unix_time:
-        await state_manager.set_state(
-            integration_id=integration_id,
-            action_id=ACTION_ID,
-            state={"last_unix_time": newest},
-            source_id=feed.feed_id,
-        )
+        and m["unixTime"] <= horizon_ts
+    ]
+    if plausible:
+        newest = min(max(plausible), now_ts)
+        if last_unix_time is None or newest > last_unix_time:
+            await state_manager.set_state(
+                integration_id=integration_id,
+                action_id=ACTION_ID,
+                state={"last_unix_time": newest},
+                source_id=feed.feed_id,
+            )
     return len(observations), dropped
+
+
+def _cooldown_key(feed_id: str) -> str:
+    return f"{feed_id}:cooldown"
 
 
 @action_title("Pull Observations")
@@ -208,56 +233,67 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
     observations_dropped = 0
     feeds_failed: List[str] = []
     feeds_skipped: List[str] = []
+    failures: List[IntegrationError] = []
 
-    for index, feed in enumerate(feeds):
-        if index:
-            await _sleep(FEED_REQUEST_SPACING_SECONDS)
-        # One poll per feed per cooldown window, across PubSub redeliveries and
-        # instances: SPOT blocks IPs that hit the same feed too often.
-        first_in_window = await state_manager.set_if_absent(
-            integration_id, ACTION_ID, ttl_seconds=FEED_COOLDOWN_SECONDS, source_id=f"{feed.feed_id}:cooldown"
-        )
-        if not first_in_window:
-            logger.info("SPOT feed %s polled less than %ss ago, skipping", feed.feed_id, FEED_COOLDOWN_SECONDS)
-            feeds_skipped.append(feed.feed_id)
-            continue
-        try:
-            sent, dropped = await _pull_feed(
-                integration_id,
-                feed,
-                subject_type=action_config.subject_type,
-                initial_lookback_hours=action_config.initial_lookback_hours,
-                state_manager=state_manager,
-                now=now,
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        for index, feed in enumerate(feeds):
+            if index:
+                await _sleep(FEED_REQUEST_SPACING_SECONDS)
+            # One poll per feed per cooldown window, across PubSub redeliveries and
+            # instances: SPOT blocks IPs that hit the same feed too often.
+            first_in_window = await state_manager.set_if_absent(
+                integration_id, ACTION_ID, ttl_seconds=FEED_COOLDOWN_SECONDS, source_id=_cooldown_key(feed.feed_id)
             )
-        except SpotFeedError as e:
-            # Feed-specific: log it against this feed and carry on with the others.
-            classified = _classify_feed_error(e)
-            logger.error("SPOT feed %s failed: %s", feed.feed_id, classified.message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id=ACTION_ID,
-                title=f"SPOT feed {feed.feed_id}: {classified.default_title}",
-                level=LogLevel.ERROR,
-                data={
-                    "feed_id": feed.feed_id,
-                    "feed_name": feed.name,
-                    "error_type": classified.error_type,
-                    "message": classified.message,
-                },
-            )
-            feeds_failed.append(feed.feed_id)
-            continue
-        except httpx.HTTPError as e:
-            # Systemic (SPOT or the network is down after retries): abort the run.
-            raise _classify_feed_error(e) from e
-        observations_sent += sent
-        observations_dropped += dropped
+            if not first_in_window:
+                logger.info("SPOT feed %s polled less than %ss ago, skipping", feed.feed_id, FEED_COOLDOWN_SECONDS)
+                feeds_skipped.append(feed.feed_id)
+                continue
+            try:
+                sent, dropped = await _pull_feed(
+                    integration_id,
+                    feed,
+                    subject_type=action_config.subject_type,
+                    initial_lookback_hours=action_config.initial_lookback_hours,
+                    state_manager=state_manager,
+                    now=now,
+                    client=client,
+                )
+            except SpotRateLimited as e:
+                # A 429 is IP-level, not per feed: stop hitting SPOT. Retryable, so
+                # PubSub redelivers after backoff; the cooldown keys throttle it.
+                raise _classify_feed_error(e) from e
+            except SpotUnreachable as e:
+                # SPOT or the network is down after retries: abort the run (retryable).
+                raise e.classified from e
+            except SpotFeedError as e:
+                # Feed-specific: log it against this feed and carry on with the others.
+                classified = _classify_feed_error(e)
+                logger.error("SPOT feed %s failed: %s", feed.feed_id, classified.message)
+                await log_action_activity(
+                    integration_id=integration_id,
+                    action_id=ACTION_ID,
+                    title=f"SPOT feed {feed.feed_id}: {classified.default_title}",
+                    level=LogLevel.ERROR,
+                    data={
+                        "feed_id": feed.feed_id,
+                        "feed_name": feed.name,
+                        "error_type": classified.error_type,
+                        "message": classified.message,
+                    },
+                )
+                feeds_failed.append(feed.feed_id)
+                failures.append(classified)
+                continue
+            observations_sent += sent
+            observations_dropped += dropped
 
     if feeds_failed and len(feeds_failed) + len(feeds_skipped) == len(feeds):
-        # Final (not redelivered by PubSub): the schedule is the only thing that re-polls SPOT.
-        raise IntegrationConfigurationError(
-            f"All {len(feeds)} SPOT feeds failed; see the feed errors in this run's activity log"
+        # Fail the run with the classification that dominates the feed errors
+        # (ties go to the first seen) so the portal title is meaningful. The
+        # message names no feed, per IntegrationConfigurationError's contract.
+        dominant = max(failures, key=lambda f: sum(1 for g in failures if g.error_type == f.error_type))
+        raise type(dominant)(
+            f"All {len(feeds_failed)} polled SPOT feeds failed; see the feed errors in this run's activity log"
         )
     return {
         "feeds": len(feeds),

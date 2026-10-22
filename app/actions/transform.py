@@ -5,9 +5,10 @@ from typing import Optional, Tuple
 # Decommissioned devices report dates around year 1000; the legacy provider
 # dropped anything from 2010 or earlier and so do we.
 OBS_MIN_YEAR = 2010
-# A message dated further ahead than this is a bad clock reading. Sending it
-# would advance the feed's high-water mark past every real message to come.
-MAX_FUTURE_SKEW = timedelta(days=1)
+# A message dated further ahead than this is a bad clock reading, not clock
+# skew. Sending it would advance the feed's high-water mark past every real
+# message to come.
+MAX_FUTURE_SKEW = timedelta(minutes=5)
 SOURCE_TYPE = "tracking-device"
 
 _OPTIONAL_ADDITIONAL = ("batteryState", "altitude")
