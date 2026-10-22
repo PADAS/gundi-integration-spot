@@ -8,16 +8,24 @@ from gundi_client_v2.errors import GundiAPIError
 from gundi_core.events import LogLevel
 from gundi_core.schemas.v2 import Integration
 
-from app.actions.client import SpotBadResponse, SpotFeedAuthError, SpotFeedNotFound, SpotRateLimited
+from app.actions.client import (
+    SpotBadResponse,
+    SpotFeedAuthError,
+    SpotFeedNotFound,
+    SpotFeedRejected,
+    SpotRateLimited,
+)
 from app.actions.configurations import PullObservationsConfig
 from app.actions.handlers import (
     ACTION_ID,
     FEED_COOLDOWN_SECONDS,
     FEED_REQUEST_SPACING_SECONDS,
     RETRY_BACKOFF_SECONDS,
+    _RedactingFilter,
     _classify_feed_error,
     _compute_window,
     _get_pull_lock,
+    _install_httpx_redaction,
     action_pull_observations,
 )
 from app.services.errors import (
@@ -265,6 +273,7 @@ async def test_feed_auth_error_is_logged_and_next_feed_runs(run, fetch, send, lo
     (SpotFeedNotFound, "configuration"),
     (SpotRateLimited, "rate_limit"),
     (SpotBadResponse, "bad_response"),
+    (SpotFeedRejected, "bad_response"),
 ])
 def test_classify_feed_error(exc, expected_type):
     assert _classify_feed_error(exc("x", code="E-0001")).error_type == expected_type
@@ -485,14 +494,25 @@ async def test_absurd_unix_time_does_not_crash_the_feed(run, fetch, send, state_
 
 
 @pytest.mark.asyncio
-async def test_stored_mark_is_capped_at_now(run, fetch, send, state_manager):
-    """A message slightly ahead of now (clock skew) is sent, but the mark never passes now,
-    so the next window never starts after it ends."""
+async def test_message_ahead_of_now_waits_for_the_next_run(run, fetch, send, state_manager):
+    """A message dated after now is neither sent nor dropped nor used to advance state:
+    the next run picks it up once now has passed it, so it is sent exactly once."""
     now_ts = int(NOW.timestamp())
-    fetch.return_value = [_msg(now_ts + 120)]
+    fetch.return_value = [_msg(now_ts + 120), _msg(T + 1)]
+    result = await run(_config("A"))
+    assert [o["recorded_at"] for o in send.await_args.kwargs["observations"]] == [
+        datetime.fromtimestamp(T + 1, tz=timezone.utc).isoformat()
+    ]
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
+    assert result["observations_dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_only_messages_ahead_of_now_sends_nothing_and_keeps_state(run, fetch, send, state_manager):
+    fetch.return_value = [_msg(int(NOW.timestamp()) + 120)]
     await run(_config("A"))
-    assert len(send.await_args.kwargs["observations"]) == 1
-    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": now_ts}
+    send.assert_not_awaited()
+    state_manager.set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -502,3 +522,59 @@ async def test_state_advances_when_all_messages_are_junk(run, fetch, send, state
     await run(_config("A"))
     send.assert_not_awaited()
     assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
+
+
+# --- third review pass -----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_failed_feeds_do_not_fail_the_run_when_others_were_skipped(run, fetch, state_manager):
+    """A redelivery that finds 49 healthy feeds in cooldown and one bad feed is not an all-failed run."""
+    state_manager.set_if_absent = AsyncMock(side_effect=lambda *a, **k: k["source_id"] == "A:cooldown")
+    fetch.side_effect = SpotFeedAuthError("Feed password required")
+    result = await run(_config("A", "B"))
+    assert result["feeds_failed"] == ["A"] and result["feeds_skipped"] == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_non_json_response_aborts_the_run(run, fetch, log_activity):
+    """A maintenance page is SPOT-wide: stop instead of logging one error per feed."""
+    fetch.side_effect = SpotBadResponse("SPOT returned a non-JSON body")
+    with pytest.raises(IntegrationBadResponseError):
+        await run(_config("A", "B"))
+    assert fetch.await_count == 1
+    log_activity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unrecognised_feed_error_is_feed_specific(run, fetch, log_activity, send):
+    async def fetch_side_effect(feed_id, *args, **kwargs):
+        if feed_id == "A":
+            raise SpotFeedRejected("Feed is disabled", code="E-0999")
+        return [_msg(T + 1)]
+    fetch.side_effect = fetch_side_effect
+    result = await run(_config("A", "B"))
+    assert result["feeds_failed"] == ["A"]
+    assert log_activity.await_args.kwargs["data"]["error_type"] == "bad_response"
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_sleep_before_a_skipped_feed(run, sleep, state_manager):
+    state_manager.set_if_absent = AsyncMock(side_effect=lambda *a, **k: k["source_id"] != "B:cooldown")
+    await run(_config("A", "B", "C"))
+    assert sleep.await_count == 1
+
+
+def test_redacting_filter_is_installed_once():
+    _install_httpx_redaction()
+    _install_httpx_redaction()
+    filters = [f for f in logging.getLogger("httpx").filters if isinstance(f, _RedactingFilter)]
+    assert len(filters) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_integer_unix_time_is_counted_on_continuation_run(run, fetch, state_manager):
+    state_manager.get_state = AsyncMock(return_value={"last_unix_time": T})
+    fetch.return_value = [_msg("bad"), _msg(T + 1)]
+    result = await run(_config("A"))
+    assert result["observations_sent"] == 1 and result["observations_dropped"] == 1

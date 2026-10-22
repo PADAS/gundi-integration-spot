@@ -13,6 +13,7 @@ from app.actions.client import (
     SpotFeedAuthError,
     SpotFeedError,
     SpotFeedNotFound,
+    SpotFeedRejected,
     SpotRateLimited,
     fetch_messages,
     format_spot_datetime,
@@ -92,7 +93,7 @@ def test_parse_feed_response_no_messages_error_is_empty():
     ("Feed password required", SpotFeedAuthError),
     ("Feed not found", SpotFeedNotFound),
     ("Invalid feed id", SpotFeedNotFound),
-    ("Something else", SpotBadResponse),
+    ("Something else", SpotFeedRejected),
 ])
 def test_parse_feed_response_error_envelope_raises(text, exc):
     with pytest.raises(exc) as info:
@@ -197,6 +198,17 @@ async def test_fetch_messages_maps_4xx(status, exc):
         with pytest.raises(exc) as info:
             await fetch_messages("F", START, END, client=client)
     assert isinstance(info.value, SpotFeedError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 302, 307])
+async def test_fetch_messages_redirect_raises_bad_response(status):
+    recorder = Recorder([httpx.Response(status, headers={"location": "https://elsewhere.example/login"})])
+    async with _client(recorder) as client:
+        with pytest.raises(SpotBadResponse) as info:
+            await fetch_messages("F", START, END, client=client)
+    assert "redirect" in str(info.value).lower()
+    assert "elsewhere" not in str(info.value)
 
 
 @pytest.mark.asyncio

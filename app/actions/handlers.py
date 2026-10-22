@@ -16,6 +16,7 @@ from app.actions.client import (
     SpotFeedAuthError,
     SpotFeedError,
     SpotFeedNotFound,
+    SpotFeedRejected,
     SpotRateLimited,
     fetch_messages,
 )
@@ -59,7 +60,14 @@ class _RedactingFilter(logging.Filter):
         return True
 
 
-logging.getLogger("httpx").addFilter(_RedactingFilter())
+def _install_httpx_redaction() -> None:
+    """Idempotent: a reload or re-import must not stack filters."""
+    httpx_logger = logging.getLogger("httpx")
+    if not any(type(f).__name__ == _RedactingFilter.__name__ for f in httpx_logger.filters):
+        httpx_logger.addFilter(_RedactingFilter())
+
+
+_install_httpx_redaction()
 
 
 def _now() -> datetime:
@@ -98,7 +106,7 @@ def _classify_feed_error(exc: Exception) -> IntegrationError:
         return IntegrationConfigurationError(message)
     if isinstance(exc, SpotRateLimited):
         return IntegrationRateLimitError(message, status_code=429)
-    if isinstance(exc, SpotBadResponse):
+    if isinstance(exc, (SpotBadResponse, SpotFeedRejected)):
         return IntegrationBadResponseError(message)
     if isinstance(exc, httpx.HTTPStatusError):
         return IntegrationBadResponseError(message, status_code=exc.response.status_code)
@@ -170,34 +178,42 @@ async def _pull_feed(
             integration_id=integration_id, action_id=ACTION_ID, source_id=_cooldown_key(feed.feed_id)
         )
         raise
-    if last_unix_time is not None:
-        # SPOT may ignore the dates, re-send, or deliver out of order: filter here regardless.
-        messages = [m for m in messages if isinstance(m.get("unixTime"), int) and m["unixTime"] > last_unix_time]
-    logger.info("SPOT feed %s: %d messages since %s", feed.feed_id, len(messages), start.isoformat())
+    now_ts = int(now.timestamp())
+    horizon_ts = now_ts + int(MAX_FUTURE_SKEW.total_seconds())
+    dropped = 0
+    current = []
+    for m in messages:
+        unix_time = m.get("unixTime")
+        if not isinstance(unix_time, int) or isinstance(unix_time, bool):
+            dropped += 1  # not a time at all: junk, counted like any other invalid message
+            continue
+        if last_unix_time is not None and unix_time <= last_unix_time:
+            continue  # SPOT may ignore the dates, re-send, or deliver out of order: already handled
+        if unix_time > horizon_ts:
+            dropped += 1  # further ahead than any clock skew: junk
+            continue
+        if unix_time > now_ts:
+            continue  # not sendable yet: a later run picks it up once now has passed it
+        current.append(m)
+    logger.info("SPOT feed %s: %d new messages since %s", feed.feed_id, len(current), start.isoformat())
 
-    observations, dropped = messages_to_observations(
-        messages, subject_type=subject_type, feed_id=feed.feed_id, now=now
+    observations, invalid = messages_to_observations(
+        current, subject_type=subject_type, feed_id=feed.feed_id, now=now
     )
+    dropped += invalid
     if dropped:
         logger.info("SPOT feed %s: dropped %d messages with invalid position or date", feed.feed_id, dropped)
     if observations:
         await send_observations_to_gundi(observations=observations, integration_id=integration_id)
 
-    # Advance to the newest plausible time seen, valid position or not, so a
-    # device sending only junk does not make every run re-fetch the same window.
-    # Plausible: an integer no further ahead than the skew allowance (a junk
-    # year-1000 date never wins; a far-future date never bricks the feed), and
-    # the stored mark never passes `now`, so the next window cannot start after
-    # it ends. Integer comparison only: no datetime conversion that could raise.
-    now_ts = int(now.timestamp())
-    horizon_ts = now_ts + int(MAX_FUTURE_SKEW.total_seconds())
-    plausible = [
-        m["unixTime"] for m in messages
-        if isinstance(m.get("unixTime"), int) and not isinstance(m.get("unixTime"), bool)
-        and m["unixTime"] <= horizon_ts
-    ]
+    # Advance to the newest time among the messages handled this run, valid
+    # position or not, so a device sending only junk does not make every run
+    # re-fetch the same window. A junk year-1000 date never wins (it is below
+    # the mark), nothing after now was included, so the next window can never
+    # start after it ends. Integer comparison only: nothing here can raise.
+    plausible = [m["unixTime"] for m in current]
     if plausible:
-        newest = min(max(plausible), now_ts)
+        newest = max(plausible)
         if last_unix_time is None or newest > last_unix_time:
             await state_manager.set_state(
                 integration_id=integration_id,
@@ -236,9 +252,8 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
     failures: List[IntegrationError] = []
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        for index, feed in enumerate(feeds):
-            if index:
-                await _sleep(FEED_REQUEST_SPACING_SECONDS)
+        polled_any = False
+        for feed in feeds:
             # One poll per feed per cooldown window, across PubSub redeliveries and
             # instances: SPOT blocks IPs that hit the same feed too often.
             first_in_window = await state_manager.set_if_absent(
@@ -248,6 +263,9 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
                 logger.info("SPOT feed %s polled less than %ss ago, skipping", feed.feed_id, FEED_COOLDOWN_SECONDS)
                 feeds_skipped.append(feed.feed_id)
                 continue
+            if polled_any:
+                await _sleep(FEED_REQUEST_SPACING_SECONDS)
+            polled_any = True
             try:
                 sent, dropped = await _pull_feed(
                     integration_id,
@@ -265,6 +283,9 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
             except SpotUnreachable as e:
                 # SPOT or the network is down after retries: abort the run (retryable).
                 raise e.classified from e
+            except SpotBadResponse as e:
+                # Not a feed response at all (maintenance page, redirect): SPOT-wide, abort (retryable).
+                raise _classify_feed_error(e) from e
             except SpotFeedError as e:
                 # Feed-specific: log it against this feed and carry on with the others.
                 classified = _classify_feed_error(e)
@@ -287,7 +308,7 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
             observations_sent += sent
             observations_dropped += dropped
 
-    if feeds_failed and len(feeds_failed) + len(feeds_skipped) == len(feeds):
+    if feeds_failed and len(feeds_failed) == len(feeds):
         # Fail the run with the classification that dominates the feed errors
         # (ties go to the first seen) so the portal title is meaningful. The
         # message names no feed, per IntegrationConfigurationError's contract.

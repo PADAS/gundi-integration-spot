@@ -46,7 +46,13 @@ class SpotRateLimited(SpotFeedError):
 
 
 class SpotBadResponse(SpotFeedError):
-    pass
+    """SPOT answered with something that is not a feed response at all (non-JSON
+    body, redirect, unexpected shape): a SPOT-wide problem, not this feed's."""
+
+
+class SpotFeedRejected(SpotFeedError):
+    """SPOT returned an error envelope for this feed that is not recognised as a
+    password or feed-id problem: feed-specific, but of unknown cause."""
 
 
 def format_spot_datetime(dt: datetime) -> str:
@@ -61,7 +67,7 @@ def _classify_error(code: Optional[str], text: str) -> SpotFeedError:
         return SpotFeedAuthError(text, code=code)
     if "feed" in lowered and any(hint in lowered for hint in ("not found", "invalid", "does not exist")):
         return SpotFeedNotFound(text, code=code)
-    return SpotBadResponse(text, code=code)
+    return SpotFeedRejected(text, code=code)
 
 
 def parse_feed_response(payload: dict) -> list:
@@ -99,8 +105,13 @@ def parse_feed_response(payload: dict) -> list:
 
 def _raise_for_client_status(response: httpx.Response) -> None:
     status = response.status_code
-    if status < 400:
+    if status < 300:
         return
+    if status < 400:
+        # Redirects are not followed: the feed password travels in the query
+        # string and must not be replayed to wherever SPOT points. The target
+        # is deliberately not quoted.
+        raise SpotBadResponse(f"SPOT redirected the feed request (HTTP {status})")
     if status >= 500:
         response.raise_for_status()
     text = f"SPOT returned HTTP {status}"

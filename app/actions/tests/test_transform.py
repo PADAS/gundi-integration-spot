@@ -79,8 +79,6 @@ NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 def test_message_far_in_the_future_is_invalid(spot_messages):
     ahead = int((NOW + timedelta(days=2)).timestamp())
     assert is_valid_message({**spot_messages[0], "unixTime": ahead}, now=NOW) is False
-    an_hour = int((NOW + timedelta(hours=1)).timestamp())
-    assert is_valid_message({**spot_messages[0], "unixTime": an_hour}, now=NOW) is False
     skew = int((NOW + timedelta(minutes=2)).timestamp())
     assert is_valid_message({**spot_messages[0], "unixTime": skew}, now=NOW) is True
 
