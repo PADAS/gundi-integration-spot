@@ -21,7 +21,7 @@ from app.actions.client import (
 )
 from app.actions.configurations import PullObservationsConfig, SpotFeed, dedupe_feeds
 from app.actions.core import action_title
-from app.actions.transform import messages_to_observations
+from app.actions.transform import MAX_FUTURE_SKEW, messages_to_observations
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.errors import (
@@ -33,18 +33,33 @@ from app.services.errors import (
     IntegrationRateLimitError,
 )
 from app.services.gundi import send_observations_to_gundi
+from app.services.redaction import redact_text
 from app.services.state import IntegrationStateManager
 
 logger = logging.getLogger(__name__)
 
 ACTION_ID = "pull_observations"
 FEED_REQUEST_SPACING_SECONDS = 2   # SPOT asks for >= 2 s between calls to different feeds
+FEED_COOLDOWN_SECONDS = 150        # SPOT asks for >= 2.5 min between calls to the same feed
 SPOT_RETENTION_DAYS = 7            # SPOT only ever serves the last 7 days
 RETRY_BACKOFF_SECONDS = (1, 2, 4)  # one attempt per entry; sleep between attempts
 REQUEST_TIMEOUT_SECONDS = 10.0
 
 # Module-level aliases so tests can patch time and sleeping without touching asyncio.
 _sleep = asyncio.sleep
+
+
+class _RedactingFilter(logging.Filter):
+    """httpx logs every request URL at INFO, and SPOT's only credential travels
+    in that URL (feedPassword=...). Mask it before the record reaches any handler."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactingFilter())
 
 
 def _now() -> datetime:
@@ -74,8 +89,9 @@ def _compute_window(
 
 
 def _classify_feed_error(exc: Exception) -> IntegrationError:
-    """Map a client exception to the template's classified errors (portal titles)."""
-    message = str(exc)
+    """Map a client exception to the template's classified errors (portal titles).
+    The message is redacted: an httpx error quotes the request URL, password included."""
+    message = redact_text(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
     if isinstance(exc, SpotFeedAuthError):
         return IntegrationAuthError(message)
     if isinstance(exc, SpotFeedNotFound):
@@ -111,7 +127,8 @@ async def _fetch_with_retries(
             if not _is_retryable(e) or attempt == attempts - 1:
                 raise
             logger.warning(
-                "SPOT request for feed %s failed (attempt %d/%d): %s", feed_id, attempt + 1, attempts, e
+                "SPOT request for feed %s failed (attempt %d/%d): %s",
+                feed_id, attempt + 1, attempts, redact_text(str(e).splitlines()[0] if str(e) else type(e).__name__),
             )
             await _sleep(RETRY_BACKOFF_SECONDS[attempt])
     raise AssertionError("unreachable")
@@ -141,7 +158,9 @@ async def _pull_feed(
         messages = [m for m in messages if isinstance(m.get("unixTime"), int) and m["unixTime"] > last_unix_time]
     logger.info("SPOT feed %s: %d messages since %s", feed.feed_id, len(messages), start.isoformat())
 
-    observations, dropped = messages_to_observations(messages, subject_type=subject_type, feed_id=feed.feed_id)
+    observations, dropped = messages_to_observations(
+        messages, subject_type=subject_type, feed_id=feed.feed_id, now=now
+    )
     if dropped:
         logger.info("SPOT feed %s: dropped %d messages with invalid position or date", feed.feed_id, dropped)
     if not observations:
@@ -149,7 +168,15 @@ async def _pull_feed(
 
     await send_observations_to_gundi(observations=observations, integration_id=integration_id)
 
-    newest = max(m["unixTime"] for m in messages if m.get("unixTime") is not None)
+    # Advance to the newest plausible time seen, valid position or not (a junk
+    # year-1000 date never wins; a far-future date is not plausible and is
+    # excluded so one bad clock reading cannot brick the feed).
+    horizon = now + MAX_FUTURE_SKEW
+    newest = max(
+        m["unixTime"] for m in messages
+        if isinstance(m.get("unixTime"), int) and not isinstance(m.get("unixTime"), bool)
+        and datetime.fromtimestamp(m["unixTime"], tz=timezone.utc) <= horizon
+    )
     if last_unix_time is None or newest > last_unix_time:
         await state_manager.set_state(
             integration_id=integration_id,
@@ -180,10 +207,20 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
     observations_sent = 0
     observations_dropped = 0
     feeds_failed: List[str] = []
+    feeds_skipped: List[str] = []
 
     for index, feed in enumerate(feeds):
         if index:
             await _sleep(FEED_REQUEST_SPACING_SECONDS)
+        # One poll per feed per cooldown window, across PubSub redeliveries and
+        # instances: SPOT blocks IPs that hit the same feed too often.
+        first_in_window = await state_manager.set_if_absent(
+            integration_id, ACTION_ID, ttl_seconds=FEED_COOLDOWN_SECONDS, source_id=f"{feed.feed_id}:cooldown"
+        )
+        if not first_in_window:
+            logger.info("SPOT feed %s polled less than %ss ago, skipping", feed.feed_id, FEED_COOLDOWN_SECONDS)
+            feeds_skipped.append(feed.feed_id)
+            continue
         try:
             sent, dropped = await _pull_feed(
                 integration_id,
@@ -217,7 +254,7 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
         observations_sent += sent
         observations_dropped += dropped
 
-    if feeds_failed and len(feeds_failed) == len(feeds):
+    if feeds_failed and len(feeds_failed) + len(feeds_skipped) == len(feeds):
         # Final (not redelivered by PubSub): the schedule is the only thing that re-polls SPOT.
         raise IntegrationConfigurationError(
             f"All {len(feeds)} SPOT feeds failed; see the feed errors in this run's activity log"
@@ -227,4 +264,5 @@ async def _pull_all_feeds(integration_id: str, action_config: PullObservationsCo
         "observations_sent": observations_sent,
         "observations_dropped": observations_dropped,
         "feeds_failed": feeds_failed,
+        "feeds_skipped": feeds_skipped,
     }

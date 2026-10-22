@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, call, patch
 
@@ -11,6 +12,7 @@ from app.actions.client import SpotBadResponse, SpotFeedAuthError, SpotFeedNotFo
 from app.actions.configurations import PullObservationsConfig
 from app.actions.handlers import (
     ACTION_ID,
+    FEED_COOLDOWN_SECONDS,
     FEED_REQUEST_SPACING_SECONDS,
     RETRY_BACKOFF_SECONDS,
     _classify_feed_error,
@@ -69,6 +71,7 @@ def state_manager():
     manager = AsyncMock()
     manager.get_state = AsyncMock(return_value={})
     manager.set_state = AsyncMock()
+    manager.set_if_absent = AsyncMock(return_value=True)
     return manager
 
 
@@ -155,7 +158,7 @@ async def test_first_run_sends_observations_and_writes_state(run, fetch, send, s
         integration_id=INTEGRATION_ID, action_id=ACTION_ID,
         state={"last_unix_time": max(m["unixTime"] for m in spot_messages)}, source_id="F1",
     )
-    assert result == {"feeds": 1, "observations_sent": 51, "observations_dropped": 0, "feeds_failed": []}
+    assert result == {"feeds": 1, "observations_sent": 51, "observations_dropped": 0, "feeds_failed": [], "feeds_skipped": []}
 
 
 @pytest.mark.asyncio
@@ -326,3 +329,86 @@ async def test_overlapping_run_is_skipped(run, fetch):
         result = await run(_config("A"))
     assert result == {"skipped": True}
     fetch.assert_not_awaited()
+
+
+# --- review fixes ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_password_never_reaches_runtime_logs_or_exception_text(
+    integration, state_manager, send, log_activity, sleep, mock_publish_event, caplog, monkeypatch
+):
+    """Critical review finding: httpx logs every request URL at INFO (with feedPassword in
+    the query), and a 5xx retry log line quoted the URL too. Run the real client path."""
+    seen = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(503, text="down", request=request)
+
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.actions.client.httpx.AsyncClient",
+        lambda **kwargs: real_async_client(transport=httpx.MockTransport(transport), **kwargs),
+    )
+    caplog.set_level(logging.INFO)
+    with patch("app.actions.handlers.IntegrationStateManager", return_value=state_manager), \
+         patch("app.actions.handlers.send_observations_to_gundi", send), \
+         patch("app.actions.handlers.log_action_activity", log_activity), \
+         patch("app.actions.handlers._sleep", sleep), \
+         patch("app.actions.handlers._now", return_value=NOW), \
+         patch("app.services.activity_logger.publish_event", mock_publish_event):
+        with pytest.raises(IntegrationBadResponseError) as info:
+            await action_pull_observations(
+                integration=integration, action_config=_config({"feed_id": "A", "feed_password": "hunter2"})
+            )
+
+    assert seen and all("feedPassword=hunter2" in url for url in seen)  # the real client sent it
+    assert "hunter2" not in caplog.text
+    assert "hunter2" not in str(info.value)
+    httpx_lines = [r.getMessage() for r in caplog.records if r.name == "httpx"]
+    assert httpx_lines and all("feedPassword=**********" in line for line in httpx_lines)
+    retry_lines = [r.getMessage() for r in caplog.records if "attempt 1/" in r.getMessage()]
+    assert retry_lines and "hunter2" not in retry_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_feed_in_cooldown_is_skipped(run, fetch, state_manager):
+    """A PubSub redelivery (or a second instance) must not re-poll a feed inside SPOT's 2.5-minute window."""
+    state_manager.set_if_absent = AsyncMock(side_effect=lambda *a, **k: k["source_id"] != "A:cooldown")
+    fetch.return_value = [_msg(T + 1)]
+    result = await run(_config("A", "B"))
+
+    assert [c.args[0] for c in fetch.await_args_list] == ["B"]
+    assert result["feeds_skipped"] == ["A"]
+    assert result["observations_sent"] == 1
+    cooldown_calls = state_manager.set_if_absent.await_args_list
+    assert [c.kwargs["source_id"] for c in cooldown_calls] == ["A:cooldown", "B:cooldown"]
+    assert {c.kwargs["ttl_seconds"] for c in cooldown_calls} == {FEED_COOLDOWN_SECONDS}
+
+
+@pytest.mark.asyncio
+async def test_all_feeds_in_cooldown_is_not_a_failure(run, fetch, state_manager):
+    state_manager.set_if_absent = AsyncMock(return_value=False)
+    result = await run(_config("A"))
+    fetch.assert_not_awaited()
+    assert result["feeds_skipped"] == ["A"] and result["feeds_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_future_dated_message_is_dropped_and_does_not_advance_state(run, fetch, send, state_manager):
+    """One bad clock reading must not brick a feed: a message 2 days ahead of now is junk."""
+    future = int((NOW + timedelta(days=2)).timestamp())
+    fetch.return_value = [_msg(T + 1), _msg(future)]
+    result = await run(_config("A"))
+
+    assert len(send.await_args.kwargs["observations"]) == 1
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
+    assert result["observations_dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_non_integer_unix_time_is_dropped_on_first_run(run, fetch, send, state_manager):
+    fetch.return_value = [_msg("not-a-time"), _msg(T + 1)]
+    result = await run(_config("A"))
+    assert result == {"feeds": 1, "observations_sent": 1, "observations_dropped": 1, "feeds_failed": [], "feeds_skipped": []}
+    assert state_manager.set_state.await_args.kwargs["state"] == {"last_unix_time": T + 1}
