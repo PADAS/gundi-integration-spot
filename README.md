@@ -1,5 +1,53 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-spot
+
+Gundi v2 integration for [SPOT](https://www.findmespot.com) satellite messengers
+(Globalstar). SPOT devices publish their positions on a *share page* whose
+contents are also served by SPOT's public feed API, keyed by a feed ID and an
+optional feed password. This runner polls those feeds and sends the positions
+to Gundi as observations, replacing the legacy `das-spot-provider` Lambda.
+
+- One Gundi connection per customer; its `pull_observations` configuration
+  holds the list of feeds (up to 50), the EarthRanger subject type (a
+  drop-down fed by the connected site, free text otherwise) and an initial
+  lookback window (up to 7 days, which is all SPOT keeps).
+- Runs every 5 minutes. Each feed remembers the newest message it has sent,
+  so only new positions are fetched; SPOT's spacing rules (2.5 min per feed,
+  2 s between feeds) are respected.
+- A bad password or unknown feed is logged against that feed in the activity
+  log and the other feeds continue; SPOT or Gundi being unreachable aborts
+  the run so it is retried on the next schedule.
+
+Design: [docs/superpowers/specs/2026-10-22-gundi-integration-spot-design.md](docs/superpowers/specs/2026-10-22-gundi-integration-spot-design.md)
+
+## Registering in Gundi
+
+```bash
+python -m app.register --slug spot --name "SPOT" \
+  --description "SPOT satellite messengers (Globalstar), via findmespot.com share feeds" \
+  --schedule "pull_observations:*/5 * * * *"
+```
+
+`--description` comes from
+[gundi-integration-action-runner#128](https://github.com/PADAS/gundi-integration-action-runner/pull/128).
+Until that is merged into this fork, drop the flag and set the description
+above on the integration type in the Gundi admin after registering.
+
+## Developing
+
+```bash
+uv venv --python 3.10 .venv && source .venv/bin/activate
+pip install pip-tools && pip-compile --output-file=requirements.txt requirements-base.in requirements-dev.in requirements.in
+pip install -r requirements.txt
+pytest
+```
+
+Fork-owned code lives in `app/actions/{client,transform,configurations,handlers}.py`
+and `app/actions/tests/`; everything else is the template and is kept
+mergeable with upstream.
+
+---
+
+# Template notes (gundi-integration-action-runner)
 
 ## Usage
 - Fork this repo
